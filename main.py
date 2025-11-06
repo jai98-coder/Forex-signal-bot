@@ -71,7 +71,7 @@ def last_cross_up(a, b):  return len(a)>1 and a.iloc[-2]<=b.iloc[-2] and a.iloc[
 def last_cross_down(a, b):return len(a)>1 and a.iloc[-2]>=b.iloc[-2] and a.iloc[-1]<b.iloc[-1]
 
 
-def generate_signal(df, pair):
+signal = generate_signal(df, "EURUSD")
     close, high, low = df["close"], df["high"], df["low"]
 
     # Indicators
