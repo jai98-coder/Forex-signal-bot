@@ -130,3 +130,28 @@ def generate_signal(df, pair):
     return {"pair": pair, "action": action, "entry": round(price,6),
             "stop_loss": round(sl,6), "take_profit": round(tp,6),
             "time": df.index[-2].isoformat(), "reason": "; ".join(reason)}
+    import os
+import requests
+from keep_alive import keep_alive
+
+keep_alive()
+
+BOT_TOKEN = os.getenv("BOT_TOKEN")
+CHAT_ID = os.getenv("CHAT_ID")
+
+def send_signal_to_telegram(signal):
+    message = (
+        f"📊 Pair: {signal['pair']}\n"
+        f"Action: {signal['action']}\n"
+        f"Entry: {signal['entry']}\n"
+        f"Stop Loss: {signal['stop_loss']}\n"
+        f"Take Profit: {signal['take_profit']}\n"
+        f"Reason: {', '.join(signal['reason'])}"
+    )
+    url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
+    data = {"chat_id": CHAT_ID, "text": message}
+    requests.post(url, data=data)
+
+# Example usage — replace `your_function_name()` with your actual signal function
+signal = your_function_name()  # <- This should call your analysis function
+send_signal_to_telegram(signal)
