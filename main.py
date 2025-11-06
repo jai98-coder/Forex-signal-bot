@@ -130,7 +130,7 @@ def generate_signal(df, pair):
     return {"pair": pair, "action": action, "entry": round(price,6),
             "stop_loss": round(sl,6), "take_profit": round(tp,6),
             "time": df.index[-2].isoformat(), "reason": "; ".join(reason)}
-    import os
+import os
 import requests
 from keep_alive import keep_alive
 
@@ -152,6 +152,6 @@ def send_signal_to_telegram(signal):
     data = {"chat_id": CHAT_ID, "text": message}
     requests.post(url, data=data)
 
-# Example usage — replace `your_function_name()` with your actual signal function
-signal = your_function_name()  # <- This should call your analysis function
-send_signal_to_telegram(signal)
+# Call your signal function and send the result to Telegram
+signal = generate_signal(df, "EURUSD")
+send_signal_to_telegram(signal)    
