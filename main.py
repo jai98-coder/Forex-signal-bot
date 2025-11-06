@@ -153,5 +153,20 @@ def send_signal_to_telegram(signal):
     requests.post(url, data=data)
 
 # Call your signal function and send the result to Telegram
+import pandas as pd
+import yfinance as yf
+
+# Fetch the latest EUR/USD hourly data
+data = yf.download("EURUSD=X", period="7d", interval="1h")
+
+# Rename columns to match your analysis code
+data.rename(columns={"Open":"open", "High":"high", "Low":"low", "Close":"close", "Volume":"volume"}, inplace=True)
+
+# Reset index and store in df
+df = data.reset_index(drop=True)
+
+# Generate signal
 signal = generate_signal(df, "EURUSD")
-send_signal_to_telegram(signal)    
+
+# Send to Telegram
+send_signal_to_telegram(signal)
