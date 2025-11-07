@@ -45,7 +45,6 @@ def last_cross_down(a, b):
 # === Signal generation ===
 
 def generate_signal(df, pair):
-    # Ensure 1D data
     close = df["Close"].squeeze()
     high = df["High"].squeeze()
     low = df["Low"].squeeze()
@@ -61,15 +60,15 @@ def generate_signal(df, pair):
 
     last = df.iloc[-2]
     curr = df.iloc[-1]
-    price = last["Close"]
-    ema200 = last["EMA200"]
-    rsi21 = last["RSI21"]
-    atr14 = last["ATR14"]
+    price = float(last["Close"])
+    ema200 = float(last["EMA200"])
+    rsi21 = float(last["RSI21"])
+    atr14 = float(last["ATR14"])
 
     action = "HOLD"
     reason = []
 
-    # Basic logic
+    # Signal logic
     if last_cross_up(df["MACD"], df["MACDs"]) and rsi21 < 70 and price > ema200:
         action = "BUY"
         reason.append("MACD bullish crossover & RSI < 70 & price above EMA200")
@@ -78,19 +77,20 @@ def generate_signal(df, pair):
         action = "SELL"
         reason.append("MACD bearish crossover & RSI > 30 & price below EMA200")
 
-    # Volatility filter
-    if atr14 < df["ATR14"].rolling(50).mean().iloc[-1] * 0.8:
+    # Volatility filter (fixed)
+    atr_mean = df["ATR14"].rolling(50).mean().iloc[-1]
+    if float(atr14) < atr_mean * 0.8:
         action = "HOLD"
         reason.append("Low volatility filter (ATR)")
 
-    # Return signal
+    # Return signal safely
     return {
         "pair": pair,
         "action": action,
-        "entry": round(float(price), 5),
+        "entry": round(price, 5),
         "stop_loss": 0,
         "take_profit": 0,
-        "time": str(df.index[-2]),  # Safe string version
+        "time": str(df.index[-2]),
         "reason": reason
     }
 
@@ -98,13 +98,13 @@ def generate_signal(df, pair):
 
 @app.route("/")
 def home():
-    return "Forex Signal Bot is running ✅"
+    return "✅ Forex Signal Bot is running"
 
 if __name__ == "__main__":
     while True:
         print("Fetching data...")
         data = yf.download("EURUSD=X", period="7d", interval="1h")
-        data.index = pd.to_datetime(data.index)  # Fix isoformat error
+        data.index = pd.to_datetime(data.index)
         signal = generate_signal(data, "EURUSD")
         print("Signal:", signal)
-        time.sleep(3600)  # every 1 hour
+        time.sleep(3600)  # Fetch every hour
