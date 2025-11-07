@@ -1,118 +1,151 @@
 import pandas as pd
 import numpy as np
-import yfinance as yf
-from flask import Flask
 import time
-import threading
+import requests
+from flask import Flask
+import os
 
 app = Flask(__name__)
 
-# === Helper functions ===
+# =========================
+# 🔧 Environment variables
+# =========================
+BOT_TOKEN = os.getenv("BOT_TOKEN")
+CHAT_ID = os.getenv("CHAT_ID")
+TWELVE_DATA_API_KEY = os.getenv("TWELVE_DATA_API_KEY")
 
-def ema(series, length):
-    return series.ewm(span=length, adjust=False).mean()
+# =========================
+# 💬 Telegram
+# =========================
+def send_telegram_message(text):
+    if BOT_TOKEN and CHAT_ID:
+        url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
+        payload = {"chat_id": CHAT_ID, "text": text}
+        try:
+            requests.post(url, json=payload, timeout=10)
+        except Exception as e:
+            print(f"⚠️ Telegram send failed: {e}")
+    else:
+        print("⚠️ Missing BOT_TOKEN or CHAT_ID")
 
+# =========================
+# 📈 Technical Indicators
+# =========================
 def rsi(series, length=14):
     delta = series.diff()
-    up = delta.clip(lower=0)
-    down = -1 * delta.clip(upper=0)
-    roll_up = pd.Series(up.squeeze(), index=series.index).rolling(length).mean()
-    roll_down = pd.Series(down.squeeze(), index=series.index).rolling(length).mean()
-    rs = roll_up / roll_down
+    gain = np.where(delta > 0, delta, 0)
+    loss = np.where(delta < 0, -delta, 0)
+    avg_gain = pd.Series(gain).rolling(length).mean()
+    avg_loss = pd.Series(loss).rolling(length).mean()
+    rs = avg_gain / avg_loss
     return 100 - (100 / (1 + rs))
 
-def macd(series, fast=12, slow=26, signal=9):
-    ema_fast = series.ewm(span=fast, adjust=False).mean()
-    ema_slow = series.ewm(span=slow, adjust=False).mean()
-    macd_line = ema_fast - ema_slow
-    signal_line = macd_line.ewm(span=signal, adjust=False).mean()
-    return macd_line, signal_line, macd_line - signal_line
-
-def atr(high, low, close, length=14):
-    prev_close = close.shift(1)
-    tr = pd.concat([
-        (high - low),
-        (high - prev_close).abs(),
-        (low - prev_close).abs()
-    ], axis=1).max(axis=1)
+def atr(df, length=14):
+    high_low = df["high"] - df["low"]
+    high_close = np.abs(df["high"] - df["close"].shift())
+    low_close = np.abs(df["low"] - df["close"].shift())
+    tr = pd.concat([high_low, high_close, low_close], axis=1).max(axis=1)
     return tr.rolling(length).mean()
 
-def last_cross_up(a, b):
-    return len(a) > 1 and a.iloc[-2] < b.iloc[-2] and a.iloc[-1] > b.iloc[-1]
-
-def last_cross_down(a, b):
-    return len(a) > 1 and a.iloc[-2] > b.iloc[-2] and a.iloc[-1] < b.iloc[-1]
-
-# === Signal generation ===
-
+# =========================
+# ⚙️ Signal Generation
+# =========================
 def generate_signal(df, pair):
-    close = df["Close"].squeeze()
-    high = df["High"].squeeze()
-    low = df["Low"].squeeze()
+    df["EMA200"] = df["close"].ewm(span=200, adjust=False).mean()
+    df["RSI21"] = rsi(df["close"], 21)
+    df["ATR14"] = atr(df, 14)
 
-    # Indicators
-    df["EMA50"] = ema(close, 50)
-    df["EMA200"] = ema(close, 200)
-    df["RSI21"] = rsi(close, 21)
-    macd_line, sig_line, _ = macd(close)
-    df["MACD"] = macd_line
-    df["MACDs"] = sig_line
-    df["ATR14"] = atr(high, low, close, 14)
-
-    last = df.iloc[-2]
-    curr = df.iloc[-1]
-    price = float(last["Close"])
+    last = df.iloc[-1]
+    price = float(last["close"])
     ema200 = float(last["EMA200"])
     rsi21 = float(last["RSI21"])
     atr14 = float(last["ATR14"])
 
-    action = "HOLD"
-    reason = []
-
-    # Signal logic
-    if last_cross_up(df["MACD"], df["MACDs"]) and rsi21 < 70 and price > ema200:
+    if price > ema200 and rsi21 > 55:
         action = "BUY"
-        reason.append("MACD bullish crossover & RSI < 70 & price above EMA200")
-
-    elif last_cross_down(df["MACD"], df["MACDs"]) and rsi21 > 30 and price < ema200:
+        reason = "Price above EMA200 and RSI > 55"
+    elif price < ema200 and rsi21 < 45:
         action = "SELL"
-        reason.append("MACD bearish crossover & RSI > 30 & price below EMA200")
-
-    # Volatility filter (fixed)
-    atr_mean = df["ATR14"].rolling(50).mean().iloc[-1]
-    if float(atr14) < atr_mean * 0.8:
+        reason = "Price below EMA200 and RSI < 45"
+    else:
         action = "HOLD"
-        reason.append("Low volatility filter (ATR)")
+        reason = "No clear momentum"
 
-    return {
+    signal = {
         "pair": pair,
         "action": action,
         "entry": round(price, 5),
-        "stop_loss": 0,
-        "take_profit": 0,
-        "time": str(df.index[-2]),
+        "stop_loss": round(price - (atr14 * 2), 5) if action == "BUY" else round(price + (atr14 * 2), 5),
+        "take_profit": round(price + (atr14 * 3), 5) if action == "BUY" else round(price - (atr14 * 3), 5),
+        "time": str(df.index[-1]),
         "reason": reason
     }
 
-# === Flask web app ===
+    print(signal)
+
+    if action in ["BUY", "SELL"]:
+        msg = (
+            f"📊 Forex Signal\n"
+            f"Pair: {signal['pair']}\n"
+            f"Action: {signal['action']}\n"
+            f"Entry: {signal['entry']}\n"
+            f"Stop Loss: {signal['stop_loss']}\n"
+            f"Take Profit: {signal['take_profit']}\n"
+            f"Reason: {signal['reason']}"
+        )
+        send_telegram_message(msg)
+
+    return signal
+
+# =========================
+# 🔄 Fetch from Twelve Data
+# =========================
+def fetch_data(symbol="EUR/USD", interval="1h"):
+    url = "https://api.twelvedata.com/time_series"
+    params = {
+        "symbol": symbol,
+        "interval": interval,
+        "outputsize": 300,
+        "apikey": TWELVE_DATA_API_KEY,
+    }
+    try:
+        response = requests.get(url, params=params, timeout=10)
+        data = response.json()
+        if "values" in data:
+            df = pd.DataFrame(data["values"])
+            df = df.rename(columns={"datetime": "time"})
+            df["time"] = pd.to_datetime(df["time"])
+            df = df.sort_values("time")
+            df = df.astype(float, errors="ignore")
+            df.set_index("time", inplace=True)
+            return df
+        else:
+            print(f"⚠️ Error fetching {symbol}: {data}")
+            return pd.DataFrame()
+    except Exception as e:
+        print(f"⚠️ API error for {symbol}: {e}")
+        return pd.DataFrame()
 
 @app.route("/")
 def home():
-    return "✅ Forex Signal Bot is running and live!"
+    return "✅ Multi-Pair Forex Signal Bot (Twelve Data API connected)"
 
-# === Background signal loop ===
-
-def run_signal_loop():
-    while True:
-        print("Fetching data...")
-        data = yf.download("EURUSD=X", period="7d", interval="1h")
-        data.index = pd.to_datetime(data.index)
-        signal = generate_signal(data, "EURUSD")
-        print("Signal:", signal)
-        time.sleep(3600)  # Wait one hour
-
-# === Start everything ===
-
+# =========================
+# 🚀 Main Loop
+# =========================
 if __name__ == "__main__":
-    threading.Thread(target=run_signal_loop, daemon=True).start()
-    app.run(host="0.0.0.0", port=10000)
+    pairs = ["EUR/USD", "GBP/USD", "USD/JPY", "XAU/USD"]
+    print("Starting Forex Signal Bot...")
+
+    while True:
+        for pair in pairs:
+            print(f"\nFetching data for {pair}...")
+            df = fetch_data(pair, "1h")
+            if not df.empty:
+                generate_signal(df, pair)
+            else:
+                print(f"⚠️ No data fetched for {pair}.")
+            time.sleep(5)  # small pause between requests
+
+        print("\n✅ Cycle complete — sleeping for 10 minutes...\n")
+        time.sleep(600)
