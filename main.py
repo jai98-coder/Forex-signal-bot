@@ -1,130 +1,97 @@
 import os
 import time
 import threading
+import json
+from datetime import datetime, timezone
+
+import requests
 import pandas as pd
 import numpy as np
-import yfinance as yf
-import requests
 from flask import Flask
 
-# ------------------ Telegram Setup ------------------
-BOT_TOKEN = os.getenv("BOT_TOKEN")
-CHAT_ID = os.getenv("CHAT_ID")
+# ---------------------------
+# Environment & defaults
+# ---------------------------
+BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
+CHAT_ID = os.getenv("CHAT_ID", "").strip()
+TD_API_KEY = os.getenv("TWELVE_DATA_API_KEY", "").strip()
+SCAN_EVERY_MIN = int(os.getenv("SCAN_EVERY_MIN", "10"))
 
-def send_telegram_message(message):
-    """Send a message to the Telegram chat."""
+# Comma separated list like: "EUR/USD,GBP/USD,USD/JPY,AUD/USD,XAU/USD"
+PAIRS_ENV = os.getenv(
+    "PAIRS",
+    "EUR/USD,GBP/USD,USD/JPY,AUD/USD,XAU/USD"
+)
+
+PAIRS = [p.strip().upper() for p in PAIRS_ENV.split(",") if p.strip()]
+
+# Telegram send helper (simple and robust)
+def tg_send(text: str, disable_notification=False):
     if not BOT_TOKEN or not CHAT_ID:
-        print("⚠️ Telegram not configured properly (BOT_TOKEN or CHAT_ID missing)")
+        print("Telegram credentials missing; skipping send.")
         return
+    url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
     try:
-        url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
-        payload = {"chat_id": CHAT_ID, "text": message}
-        requests.post(url, json=payload)
+        requests.post(
+            url,
+            json={
+                "chat_id": CHAT_ID,
+                "text": text,
+                "parse_mode": "HTML",
+                "disable_notification": disable_notification,
+            },
+            timeout=15,
+        )
     except Exception as e:
-        print(f"❌ Telegram send failed: {e}")
+        print("Telegram send error:", e)
 
-# ------------------ Indicators ------------------
-def EMA(series, period=200):
-    return series.ewm(span=period, adjust=False).mean()
+# ---------------------------
+# Data: Twelve Data helpers
+# ---------------------------
+TwelveBase = "https://api.twelvedata.com/time_series"
 
-def RSI(series, period=21):
+def fetch_timeseries(symbol: str, interval="1h", outputsize=300):
+    """
+    Returns pandas.DataFrame with columns: open, high, low, close (float) indexed by UTC datetime ascending.
+    """
+    params = {
+        "symbol": symbol,
+        "interval": interval,
+        "outputsize": outputsize,
+        "format": "JSON",
+        "apikey": TD_API_KEY,
+        "timezone": "UTC",
+        "order": "ASC",
+    }
+    r = requests.get(TwelveBase, params=params, timeout=20)
+    r.raise_for_status()
+    j = r.json()
+    if "status" in j and j["status"] == "error":
+        raise RuntimeError(f"Twelve Data error for {symbol}: {j.get('message')}")
+    values = j.get("values")
+    if not values:
+        raise RuntimeError(f"No data for {symbol}")
+
+    df = pd.DataFrame(values)
+    # TwelveData uses strings, convert
+    df.rename(
+        columns={"datetime": "time", "open": "Open", "high": "High", "low": "Low", "close": "Close"},
+        inplace=True,
+    )
+    df["time"] = pd.to_datetime(df["time"], utc=True)
+    for col in ["Open", "High", "Low", "Close"]:
+        df[col] = pd.to_numeric(df[col], errors="coerce")
+    df = df.dropna().set_index("time").sort_index()
+    return df
+
+# ---------------------------
+# Indicators
+# ---------------------------
+def rsi(series: pd.Series, length: int = 21) -> pd.Series:
     delta = series.diff()
-    gain = delta.clip(lower=0)
-    loss = -delta.clip(upper=0)
-    avg_gain = gain.rolling(window=period).mean()
-    avg_loss = loss.rolling(window=period).mean()
-    rs = avg_gain / avg_loss
-    return 100 - (100 / (1 + rs))
-
-def ATR(df, period=14):
-    high_low = df["High"] - df["Low"]
-    high_close = np.abs(df["High"] - df["Close"].shift())
-    low_close = np.abs(df["Low"] - df["Close"].shift())
-    ranges = pd.concat([high_low, high_close, low_close], axis=1)
-    true_range = np.max(ranges, axis=1)
-    return true_range.rolling(window=period).mean()
-
-# ------------------ Signal Generation ------------------
-def generate_signal(df):
-    """Generate buy/sell signal for given forex data."""
-    if df is None or df.empty:
-        return None
-
-    df["EMA200"] = EMA(df["Close"], 200)
-    df["RSI21"] = RSI(df["Close"], 21)
-    df["ATR14"] = ATR(df, 14)
-    last = df.iloc[-1]
-
-    price = float(last["Close"])
-    ema200 = float(last["EMA200"])
-    rsi21 = float(last["RSI21"])
-
-    if price > ema200 and rsi21 < 70:
-        return "BUY"
-    elif price < ema200 and rsi21 > 30:
-        return "SELL"
-    else:
-        return None
-
-# ------------------ Data Fetching ------------------
-def fetch_data(symbol):
-    """Fetch forex data from Yahoo Finance safely."""
-    try:
-        data = yf.download(symbol, period="7d", interval="1h")
-        if data is None or data.empty:
-            print(f"⚠️ No data for {symbol}")
-            return None
-        return data
-    except Exception as e:
-        print(f"❌ Error fetching {symbol}: {e}")
-        return None
-
-# ------------------ Forex Pairs ------------------
-PAIRS = [
-    "EURUSD=X",
-    "GBPUSD=X",
-    "USDJPY=X",
-    "AUDUSD=X",
-    "GC=F"  # Gold futures (reliable on Yahoo)
-]
-
-# ------------------ Bot Logic ------------------
-def check_signals():
-    print("🔄 Checking forex signals...")
-    for pair in PAIRS:
-        try:
-            df = fetch_data(pair)
-            if df is None or df.empty:
-                print(f"⚠️ No data for {pair}, skipping.")
-                continue
-
-            signal = generate_signal(df)
-            if signal:
-                message = f"📊 {pair.replace('=X', '')} Signal: {signal}"
-                print(message)
-                send_telegram_message(message)
-            else:
-                print(f"{pair.replace('=X', '')} — No signal.")
-        except Exception as e:
-            print(f"❌ Error processing {pair}: {e}")
-    print("✅ Done checking signals.\n")
-
-def run_bot():
-    send_telegram_message("🤖 Forex Bot started on Render ✅")
-    while True:
-        check_signals()
-        time.sleep(600)  # every 10 minutes
-
-# ------------------ Flask App (keeps Render alive) ------------------
-app = Flask(__name__)
-
-@app.route("/")
-def home():
-    return "✅ Forex Signal Bot is running."
-
-# ------------------ Start Everything ------------------
-if __name__ == "__main__":
-    bot_thread = threading.Thread(target=run_bot)
-    bot_thread.daemon = True
-    bot_thread.start()
-    app.run(host="0.0.0.0", port=10000)
+    up = np.where(delta > 0, delta, 0.0)
+    down = np.where(delta < 0, -delta, 0.0)
+    roll_up = pd.Series(up, index=series.index).ewm(alpha=1/length, adjust=False).mean()
+    roll_down = pd.Series(down, index=series.index).ewm(alpha=1/length, adjust=False).mean()
+    rs = roll_up / (roll_down + 1e-12)
+    return 100.0 - (100.0 /
