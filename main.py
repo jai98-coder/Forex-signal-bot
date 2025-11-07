@@ -43,7 +43,9 @@ def last_cross_down(a, b):
 # --- Signal generation ---
 
 def generate_signal(df, pair):
-    close, high, low = df["close"], df["high"], df["low"]
+    close = df["close"].squeeze()
+    high = df["high"].squeeze()
+    low = df["low"].squeeze()
 
     # Indicators
     df["EMA50"] = ema(close, 50)
