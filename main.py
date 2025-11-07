@@ -65,7 +65,7 @@ def generate_signal(df, pair):
     action = "HOLD"
     reason = []
 
-    if atr14 < df["ATR14"].rolling(50).mean().iloc[-1] * 0.8:
+    if atr14.iloc[-1] < df["ATR14"].rolling(50).mean().iloc[-1] * 0.8:
         reason.append("Low volatility (ATR below average)")
         return {"pair": pair, "action": "HOLD", "entry": price, "stop_loss": 0, "take_profit": 0, "time": df.index[-2].isoformat(), "reason": reason}
 
