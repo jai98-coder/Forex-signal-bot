@@ -1,4 +1,6 @@
 pandas
-yfinance
-ta
 requests
+yfinance
+python-telegram-bot==13.15
+flask
+ta
