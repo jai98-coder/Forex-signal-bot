@@ -3,6 +3,7 @@ import numpy as np
 import yfinance as yf
 from flask import Flask
 import time
+import threading
 
 app = Flask(__name__)
 
@@ -83,7 +84,6 @@ def generate_signal(df, pair):
         action = "HOLD"
         reason.append("Low volatility filter (ATR)")
 
-    # Return signal safely
     return {
         "pair": pair,
         "action": action,
@@ -94,17 +94,25 @@ def generate_signal(df, pair):
         "reason": reason
     }
 
-# === Flask app (keeps Render alive) ===
+# === Flask web app ===
 
 @app.route("/")
 def home():
-    return "✅ Forex Signal Bot is running"
+    return "✅ Forex Signal Bot is running and live!"
 
-if __name__ == "__main__":
+# === Background signal loop ===
+
+def run_signal_loop():
     while True:
         print("Fetching data...")
         data = yf.download("EURUSD=X", period="7d", interval="1h")
         data.index = pd.to_datetime(data.index)
         signal = generate_signal(data, "EURUSD")
         print("Signal:", signal)
-        time.sleep(3600)  # Fetch every hour
+        time.sleep(3600)  # Wait one hour
+
+# === Start everything ===
+
+if __name__ == "__main__":
+    threading.Thread(target=run_signal_loop, daemon=True).start()
+    app.run(host="0.0.0.0", port=10000)
