@@ -1,0 +1,13 @@
+services:
+  - type: worker
+    name: forex-signal-bot
+    env: python
+    startCommand: "python main.py"
+    plan: free
+    envVars:
+      - key: BOT_TOKEN
+        sync: false
+      - key: CHAT_ID
+        sync: false
+      - key: TWELVE_DATA_API_KEY
+        sync: false
