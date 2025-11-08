@@ -9,7 +9,7 @@ from telegram import Bot
 # ======================
 # TELEGRAM CONFIG
 # ======================
-TOKEN = os.getenv("BOT_TOKEN")  # Must match Render Environment Variable
+TOKEN = os.getenv("BOT_TOKEN")
 CHAT_ID = os.getenv("CHAT_ID")
 
 bot = Bot(token=TOKEN)
@@ -27,12 +27,11 @@ PERIOD = "1d"
 # ======================
 def get_signals():
     for pair in PAIRS:
-        symbol = pair + "=X"  # yfinance requires this format for Forex
-
+        symbol = pair + "=X"
         data = yf.download(symbol, period=PERIOD, interval=TIMEFRAME)
 
         if data.empty:
-            print(f"⚠️ No data found for {pair}")
+            print(f"⚠️ No data for {pair}")
             continue
 
         close = data["Close"].squeeze()
@@ -47,15 +46,14 @@ def get_signals():
         rsi = data["rsi"].iloc[-1]
         price = close.iloc[-1]
 
-        # SIGNAL LOGIC
         signal = None
         sl = None
         tp = None
 
         if ema_short > ema_long and rsi < 70:
             signal = "📈 BUY"
-            sl = price * 0.995  # 0.5% Stop Loss
-            tp = price * 1.010  # 1% Take Profit
+            sl = price * 0.995
+            tp = price * 1.010
         elif ema_short < ema_long and rsi > 30:
             signal = "📉 SELL"
             sl = price * 1.005
@@ -63,39 +61,45 @@ def get_signals():
         else:
             signal = "⏸ No clear signal"
 
-        # Format message
         message = (
             f"{signal} Signal for {pair}\n"
-            f"Price: {price:.5f}\n"
-            f"RSI: {rsi:.2f}\n"
+            f"Price: {price:.5f}\nRSI: {rsi:.2f}\n"
         )
-
         if "BUY" in signal or "SELL" in signal:
             message += f"🎯 TP: {tp:.5f}\n🛑 SL: {sl:.5f}"
 
         print(message)
 
-        # Send to Telegram
         try:
             bot.send_message(chat_id=CHAT_ID, text=message)
         except Exception as e:
-            print(f"Telegram Error for {pair}: {e}")
+            print(f"Telegram Error: {e}")
 
 # ======================
 # FLASK KEEP-ALIVE
 # ======================
 @app.route("/")
 def home():
-    return "✅ Forex Signal Bot is running successfully!"
+    return "✅ Forex Signal Bot is running on Render!"
 
 # ======================
 # MAIN LOOP
 # ======================
 if __name__ == "__main__":
-    print("🚀 Starting Multi-Pair Forex Signal Bot...")
-    while True:
-        try:
-            get_signals()
-        except Exception as e:
-            print(f"⚠️ Error: {e}")
-        time.sleep(900)  # 15 minutes
+    from threading import Thread
+
+    def run_flask():
+        port = int(os.environ.get("PORT", 8080))
+        app.run(host="0.0.0.0", port=port)
+
+    def run_bot():
+        print("🚀 Starting Multi-Pair Forex Signal Bot...")
+        while True:
+            try:
+                get_signals()
+            except Exception as e:
+                print(f"⚠️ Error: {e}")
+            time.sleep(900)  # 15 minutes
+
+    Thread(target=run_flask).start()
+    run_bot()
