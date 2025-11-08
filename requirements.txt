@@ -1,6 +1,4 @@
-Flask
-yfinance==0.2.48
-pandas==2.2.2
-ta
-python-telegram-bot==13.15
-gunicorn
+pandas
+requests
+flask
+python-telegram-bot
