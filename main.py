@@ -33,7 +33,7 @@ def get_signals():
         if len(data) < 50:
             continue
 
-        data["rsi"] = ta.momentum.RSIIndicator(data["Close"], window=14).rsi()
+        data["rsi"] = ta.momentum.RSIIndicator(data["Close"].squeeze(), window=14).rsi()
         data["ema_short"] = ta.trend.EMAIndicator(data["Close"], window=9).ema_indicator()
         data["ema_long"] = ta.trend.EMAIndicator(data["Close"], window=21).ema_indicator()
 
