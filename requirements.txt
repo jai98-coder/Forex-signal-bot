@@ -2,3 +2,4 @@ pandas
 requests
 flask
 python-telegram-bot
+yfinance
