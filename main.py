@@ -1,51 +1,69 @@
 import os
 import time
-import yfinance as yf
 import pandas as pd
+import yfinance as yf
 import ta
-from telegram import Bot
 from flask import Flask
-from threading import Thread
+from telegram import Bot
 
-# Telegram setup
-BOT_TOKEN = os.getenv("BOT_TOKEN")
-CHAT_ID = os.getenv("CHAT_ID")
-bot = Bot(token=BOT_TOKEN)
+# ======================
+# Telegram Bot Setup
+# ======================
+TOKEN = os.getenv("TELEGRAM_TOKEN")
+CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 
-# Flask web server (for Render uptime)
+bot = Bot(token=TOKEN)
+
 app = Flask(__name__)
 
-@app.route('/')
-def home():
-    return "Forex Bot is running"
-
-def run():
-    app.run(host='0.0.0.0', port=8080)
-
-Thread(target=run).start()
-
-# Pairs to track
-pairs = ["EURUSD=X", "GBPUSD=X", "USDJPY=X", "AUDUSD=X", "USDCAD=X"]
-
+# ======================
+# Forex Signal Function
+# ======================
 def get_signals():
-    for pair in pairs:
-        data = yf.download(pair, period="1d", interval="15m")
-        if len(data) < 50:
-            continue
+    pair = "EURUSD=X"
+    data = yf.download(pair, period="1d", interval="15m")
 
-        data["rsi"] = ta.momentum.RSIIndicator(data["Close"].squeeze(), window=14).rsi()
-        data["ema_short"] = ta.trend.EMAIndicator(data["Close"], window=9).ema_indicator()
-        data["ema_long"] = ta.trend.EMAIndicator(data["Close"], window=21).ema_indicator()
+    if data.empty:
+        print("No data retrieved.")
+        return
 
-        last = data.iloc[-1]
-        previous = data.iloc[-2]
+    # Ensure 1D series to avoid ValueError
+    close = data["Close"].squeeze()
 
-        # Buy / Sell logic
-        if previous["ema_short"] < previous["ema_long"] and last["ema_short"] > last["ema_long"] and last["rsi"] < 70:
-            bot.send_message(chat_id=CHAT_ID, text=f"📈 BUY signal for {pair}")
-        elif previous["ema_short"] > previous["ema_long"] and last["ema_short"] < last["ema_long"] and last["rsi"] > 30:
-            bot.send_message(chat_id=CHAT_ID, text=f"📉 SELL signal for {pair}")
+    # Technical Indicators
+    data["ema_short"] = ta.trend.EMAIndicator(close, window=9).ema_indicator()
+    data["ema_long"] = ta.trend.EMAIndicator(close, window=21).ema_indicator()
+    data["rsi"] = ta.momentum.RSIIndicator(close, window=14).rsi()
 
-while True:
-    get_signals()
-    time.sleep(900)  # every 15 minutes
+    # Latest values
+    ema_short = data["ema_short"].iloc[-1]
+    ema_long = data["ema_long"].iloc[-1]
+    rsi = data["rsi"].iloc[-1]
+    price = close.iloc[-1]
+
+    # Trading logic
+    if ema_short > ema_long and rsi < 70:
+        signal = f"📈 BUY Signal for {pair}\nPrice: {price:.5f}\nRSI: {rsi:.2f}"
+    elif ema_short < ema_long and rsi > 30:
+        signal = f"📉 SELL Signal for {pair}\nPrice: {price:.5f}\nRSI: {rsi:.2f}"
+    else:
+        signal = f"⏸ No clear signal for {pair}\nPrice: {price:.5f}\nRSI: {rsi:.2f}"
+
+    print(signal)
+    bot.send_message(chat_id=CHAT_ID, text=signal)
+
+# ======================
+# Flask Web Server (Keep alive for Render)
+# ======================
+@app.route("/")
+def home():
+    return "Bot is running!"
+
+if __name__ == "__main__":
+    print("Starting Forex Signal Bot...")
+    while True:
+        try:
+            get_signals()
+        except Exception as e:
+            print(f"Error: {e}")
+        time.sleep(900)  # every 15 minutes
