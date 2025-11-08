@@ -4,7 +4,6 @@ sys.modules['imghdr'] = types.SimpleNamespace(what=lambda *_: None)
 # -----------------------------------------------------------------------
 
 import os
-import math
 import logging
 from typing import Tuple
 
@@ -15,7 +14,7 @@ from ta.trend import EMAIndicator
 from ta.momentum import RSIIndicator
 from ta.volatility import AverageTrueRange
 from apscheduler.schedulers.background import BackgroundScheduler
-import telebot  # ✅ modern Telegram library
+import telebot  # Telegram bot
 
 # -----------------------------------------------------------------------
 # ENVIRONMENT CONFIG
@@ -61,17 +60,20 @@ def fetch_signal(symbol: str) -> Tuple[bool, str]:
     if data is None or data.empty:
         return False, f"{symbol}: no data."
 
-    # --- FIX: Flatten data to avoid 2D array errors ---
-    data = data.squeeze()
-    if isinstance(data["Close"], pd.DataFrame):
-        data["Close"] = data["Close"].squeeze()
-    if isinstance(data["High"], pd.DataFrame):
-        data["High"] = data["High"].squeeze()
-    if isinstance(data["Low"], pd.DataFrame):
-        data["Low"] = data["Low"].squeeze()
-    # --------------------------------------------------
+    # --- NEW FIX: drop multi-index & flatten all columns ---
+    if isinstance(data.columns, pd.MultiIndex):
+        data.columns = [c[0] for c in data.columns]
+    data = data.loc[:, ~data.columns.duplicated()].copy()
+
+    # force flatten each main column
+    for col in ["Close", "High", "Low"]:
+        if col in data.columns:
+            data[col] = pd.Series(data[col]).astype(float).squeeze()
+            if hasattr(data[col], "values") and data[col].values.ndim > 1:
+                data[col] = data[col].values.reshape(-1)
 
     close, high, low = data["Close"], data["High"], data["Low"]
+
     ema_fast = EMAIndicator(close, EMA_FAST).ema_indicator()
     ema_slow = EMAIndicator(close, EMA_SLOW).ema_indicator()
     rsi = RSIIndicator(close, RSI_LEN).rsi()
@@ -121,11 +123,11 @@ def run_scan():
 # WEB + SCHEDULER
 # -----------------------------------------------------------------------
 @app.route("/")
-def index(): 
+def index():
     return "Forex Signal Bot running ✅"
 
 @app.route("/health")
-def health(): 
+def health():
     return "ok"
 
 def start_scheduler():
@@ -144,9 +146,9 @@ if __name__ == "__main__":
         log.error("Missing Telegram env vars.")
         app.run(host="0.0.0.0", port=PORT)
     else:
-        try: 
+        try:
             run_scan()
-        except Exception as e: 
+        except Exception as e:
             log.exception(e)
         start_scheduler()
         app.run(host="0.0.0.0", port=PORT)
