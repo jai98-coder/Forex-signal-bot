@@ -61,6 +61,16 @@ def fetch_signal(symbol: str) -> Tuple[bool, str]:
     if data is None or data.empty:
         return False, f"{symbol}: no data."
 
+    # --- FIX: Flatten data to avoid 2D array errors ---
+    data = data.squeeze()
+    if isinstance(data["Close"], pd.DataFrame):
+        data["Close"] = data["Close"].squeeze()
+    if isinstance(data["High"], pd.DataFrame):
+        data["High"] = data["High"].squeeze()
+    if isinstance(data["Low"], pd.DataFrame):
+        data["Low"] = data["Low"].squeeze()
+    # --------------------------------------------------
+
     close, high, low = data["Close"], data["High"], data["Low"]
     ema_fast = EMAIndicator(close, EMA_FAST).ema_indicator()
     ema_slow = EMAIndicator(close, EMA_SLOW).ema_indicator()
@@ -111,10 +121,12 @@ def run_scan():
 # WEB + SCHEDULER
 # -----------------------------------------------------------------------
 @app.route("/")
-def index(): return "Forex Signal Bot running ✅"
+def index(): 
+    return "Forex Signal Bot running ✅"
 
 @app.route("/health")
-def health(): return "ok"
+def health(): 
+    return "ok"
 
 def start_scheduler():
     sched = BackgroundScheduler(timezone="UTC")
@@ -132,7 +144,9 @@ if __name__ == "__main__":
         log.error("Missing Telegram env vars.")
         app.run(host="0.0.0.0", port=PORT)
     else:
-        try: run_scan()
-        except Exception as e: log.exception(e)
+        try: 
+            run_scan()
+        except Exception as e: 
+            log.exception(e)
         start_scheduler()
         app.run(host="0.0.0.0", port=PORT)
