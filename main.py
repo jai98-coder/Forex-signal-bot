@@ -1,154 +1,174 @@
-# --- Patch for Python 3.13 removing stdlib imghdr (some libs import it) ---
-import sys, types
-sys.modules['imghdr'] = types.SimpleNamespace(what=lambda *_: None)
-# -----------------------------------------------------------------------
-
 import os
 import logging
-from typing import Tuple
-
-from flask import Flask
+from datetime import datetime
+import requests
 import pandas as pd
-import yfinance as yf
-from ta.trend import EMAIndicator
-from ta.momentum import RSIIndicator
-from ta.volatility import AverageTrueRange
 from apscheduler.schedulers.background import BackgroundScheduler
-import telebot  # Telegram bot
+from flask import Flask
 
-# -----------------------------------------------------------------------
-# ENVIRONMENT CONFIG
-# -----------------------------------------------------------------------
+# ============ ENV ============
+TD_API_KEY = os.getenv("TWELVEDATA_API_KEY", "").strip()
 BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
 CHAT_ID = os.getenv("CHAT_ID", "").strip()
-PAIRS = [s.strip().upper() for s in os.getenv("PAIRS", "EURUSD,GBPUSD,USDJPY").split(",") if s.strip()]
-TIMEFRAME = os.getenv("TIMEFRAME", "15m").strip()
-PERIOD = os.getenv("PERIOD", "2d").strip()
+PAIRS = os.getenv("PAIRS", "EURUSD,GBPUSD,USDJPY")
 
-EMA_FAST = int(os.getenv("EMA_FAST", "9"))
-EMA_SLOW = int(os.getenv("EMA_SLOW", "21"))
-RSI_LEN  = int(os.getenv("RSI_LEN", "14"))
-ATR_LEN  = int(os.getenv("ATR_LEN", "14"))
-SL_ATR   = float(os.getenv("SL_ATR", "1.5"))
-TP_ATR   = float(os.getenv("TP_ATR", "2.0"))
-CHECK_EVERY_MIN = int(os.getenv("CHECK_EVERY_MIN", "15"))
-PORT = int(os.getenv("PORT", "8080"))
+INTERVAL = "30min"
+SCAN_EVERY_S = 30 * 60  # every 30 minutes
 
-# -----------------------------------------------------------------------
-# INIT
-# -----------------------------------------------------------------------
-app = Flask(__name__)
+EMA_FAST = 9
+EMA_SLOW = 21
+RSI_LEN = 14
+ATR_LEN = 14
+RSI_BUY_MIN = 55.0
+RSI_SELL_MAX = 45.0
+ATR_MULT_SL = 1.5
+TP_R_MULT = 2.0
+
 logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)s | %(message)s")
-log = logging.getLogger("forex-bot")
-bot = telebot.TeleBot(BOT_TOKEN) if BOT_TOKEN else None
+log = logging.getLogger(__name__)
 
+last_signal_dir = {}
 
-def yahoo_symbol(sym: str) -> str:
-    return sym if sym.endswith("=X") else f"{sym}=X"
+# ============ HELPERS ============
+def td_symbol(pair):
+    pair = pair.upper()
+    if len(pair) == 6:
+        return f"{pair[:3]}/{pair[3:]}"
+    return pair
 
+def fetch_data(pair):
+    url = "https://api.twelvedata.com/time_series"
+    params = {
+        "symbol": td_symbol(pair),
+        "interval": INTERVAL,
+        "apikey": TD_API_KEY,
+        "outputsize": 200,
+        "order": "asc",
+    }
+    r = requests.get(url, params=params, timeout=20)
+    r.raise_for_status()
+    data = r.json()
+    if "values" not in data:
+        raise ValueError(f"TwelveData error: {data}")
+    df = pd.DataFrame(data["values"])
+    for col in ["open", "high", "low", "close"]:
+        df[col] = pd.to_numeric(df[col], errors="coerce")
+    df["datetime"] = pd.to_datetime(df["datetime"])
+    df = df.sort_values("datetime").reset_index(drop=True)
+    return df
 
-def decimals_for(sym: str) -> int:
-    return 3 if sym.endswith("JPY") else 5
+def ema(series, length):
+    return series.ewm(span=length, adjust=False).mean()
 
+def rsi(series, length=14):
+    delta = series.diff()
+    gain = (delta.clip(lower=0)).rolling(length).mean()
+    loss = (-delta.clip(upper=0)).rolling(length).mean()
+    rs = gain / loss
+    return 100 - (100 / (1 + rs))
 
-# -----------------------------------------------------------------------
-# STRATEGY
-# -----------------------------------------------------------------------
-def fetch_signal(symbol: str) -> Tuple[bool, str]:
-    ysym = yahoo_symbol(symbol)
-    data = yf.download(ysym, period=PERIOD, interval=TIMEFRAME, progress=False)
-    if data is None or data.empty:
-        return False, f"{symbol}: no data."
+def atr(df, length=14):
+    high, low, close = df["high"], df["low"], df["close"]
+    prev_close = close.shift(1)
+    tr = pd.concat([(high - low), (high - prev_close).abs(), (low - prev_close).abs()], axis=1).max(axis=1)
+    return tr.rolling(length).mean()
 
-    # --- NEW FIX: drop multi-index & flatten all columns ---
-    if isinstance(data.columns, pd.MultiIndex):
-        data.columns = [c[0] for c in data.columns]
-    data = data.loc[:, ~data.columns.duplicated()].copy()
+def cross_above(f_now, s_now, f_prev, s_prev):
+    return f_prev <= s_prev and f_now > s_now
 
-    # force flatten each main column
-    for col in ["Close", "High", "Low"]:
-        if col in data.columns:
-            data[col] = pd.Series(data[col]).astype(float).squeeze()
-            if hasattr(data[col], "values") and data[col].values.ndim > 1:
-                data[col] = data[col].values.reshape(-1)
+def cross_below(f_now, s_now, f_prev, s_prev):
+    return f_prev >= s_prev and f_now < s_now
 
-    close, high, low = data["Close"], data["High"], data["Low"]
+def send_telegram(text):
+    if not BOT_TOKEN or not CHAT_ID:
+        log.error("Missing Telegram vars")
+        return
+    url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
+    data = {"chat_id": CHAT_ID, "text": text, "parse_mode": "HTML"}
+    try:
+        requests.post(url, json=data, timeout=10)
+    except Exception as e:
+        log.error("Telegram send failed: %s", e)
 
-    ema_fast = EMAIndicator(close, EMA_FAST).ema_indicator()
-    ema_slow = EMAIndicator(close, EMA_SLOW).ema_indicator()
-    rsi = RSIIndicator(close, RSI_LEN).rsi()
-    atr = AverageTrueRange(high, low, close, ATR_LEN, fillna=False).average_true_range()
+def check_signal(pair):
+    df = fetch_data(pair)
+    close = df["close"]
+    ema_fast = ema(close, EMA_FAST)
+    ema_slow = ema(close, EMA_SLOW)
+    rsi_val = rsi(close, RSI_LEN)
+    atr_val = atr(df, ATR_LEN)
 
-    price, e_fast, e_slow, r, a = float(close.iloc[-1]), float(ema_fast.iloc[-1]), float(ema_slow.iloc[-1]), float(rsi.iloc[-1]), float(atr.iloc[-1])
-    dec = decimals_for(symbol)
+    ema_f_n, ema_f_p = ema_fast.iloc[-1], ema_fast.iloc[-2]
+    ema_s_n, ema_s_p = ema_slow.iloc[-1], ema_slow.iloc[-2]
+    price = close.iloc[-1]
+    rsi_n = rsi_val.iloc[-1]
+    atr_n = atr_val.iloc[-1]
 
-    if e_fast > e_slow and r > 50:
-        direction = "BUY"
-        sl, tp = price - SL_ATR * a, price + TP_ATR * a
-    elif e_fast < e_slow and r < 50:
-        direction = "SELL"
-        sl, tp = price + SL_ATR * a, price - TP_ATR * a
+    buy = cross_above(ema_f_n, ema_s_n, ema_f_p, ema_s_p) and rsi_n > RSI_BUY_MIN
+    sell = cross_below(ema_f_n, ema_s_n, ema_f_p, ema_s_p) and rsi_n < RSI_SELL_MAX
+
+    prev = last_signal_dir.get(pair)
+    direction = "BUY" if buy else "SELL" if sell else None
+
+    if not direction or direction == prev:
+        return None
+
+    # Calculate SL/TP
+    risk = atr_n * ATR_MULT_SL
+    if pair.endswith("JPY"):
+        pip = 0.01
     else:
-        return False, f"{symbol}: no clear signal (RSI={r:.1f})"
+        pip = 0.0001
 
-    msg = (
-        f"📊 *{symbol}* SIGNAL\n"
-        f"➡️ {direction}\n"
-        f"💰 Price: {price:.{dec}f}\n"
-        f"📈 EMA({EMA_FAST})={e_fast:.{dec}f}, EMA({EMA_SLOW})={e_slow:.{dec}f}\n"
-        f"📉 RSI({RSI_LEN})={r:.1f}\n"
-        f"📏 ATR({ATR_LEN})={a:.{dec}f}\n"
-        f"🛑 SL: {sl:.{dec}f}\n"
-        f"🎯 TP: {tp:.{dec}f}\n"
-        f"⏱ {TIMEFRAME}"
+    if direction == "BUY":
+        sl = price - risk
+        tp = price + risk * TP_R_MULT
+        emoji = "🟢"
+    else:
+        sl = price + risk
+        tp = price - risk * TP_R_MULT
+        emoji = "🔴"
+
+    last_signal_dir[pair] = direction
+
+    return (
+        f"💱 <b>{pair}</b>\n"
+        f"{emoji} <b>{direction}</b>\n"
+        f"💰 Price: {price:.5f}\n"
+        f"🛑 SL: {sl:.5f}\n"
+        f"🎯 TP: {tp:.5f}"
     )
-    return True, msg
-
 
 def run_scan():
-    if not bot or not CHAT_ID:
-        log.error("Missing BOT_TOKEN or CHAT_ID")
-        return
-    for sym in PAIRS:
+    pairs = [p.strip().upper() for p in PAIRS.split(",")]
+    for p in pairs:
         try:
-            ok, msg = fetch_signal(sym)
-            log.info(msg)
-            if ok:
-                bot.send_message(CHAT_ID, msg, parse_mode="Markdown")
+            signal = check_signal(p)
+            if signal:
+                log.info(f"Signal for {p}: {signal}")
+                send_telegram(signal)
+            else:
+                log.info(f"No valid signal for {p}")
         except Exception as e:
-            log.exception(f"Error {sym}: {e}")
+            log.error(f"Error {p}: {e}")
 
+# ============ FLASK (keep alive) ============
+app = Flask(__name__)
 
-# -----------------------------------------------------------------------
-# WEB + SCHEDULER
-# -----------------------------------------------------------------------
-@app.route("/")
-def index():
-    return "Forex Signal Bot running ✅"
-
-@app.route("/health")
+@app.get("/")
 def health():
-    return "ok"
+    return "OK", 200
 
-def start_scheduler():
-    sched = BackgroundScheduler(timezone="UTC")
-    sched.add_job(run_scan, "interval", minutes=CHECK_EVERY_MIN)
-    sched.start()
-    log.info(f"Scheduler started every {CHECK_EVERY_MIN} min: {PAIRS}")
-
-
-# -----------------------------------------------------------------------
-# MAIN
-# -----------------------------------------------------------------------
-if __name__ == "__main__":
+def main():
     log.info("🚀 Starting Forex Signal Bot")
-    if not BOT_TOKEN or not CHAT_ID:
-        log.error("Missing Telegram env vars.")
-        app.run(host="0.0.0.0", port=PORT)
-    else:
-        try:
-            run_scan()
-        except Exception as e:
-            log.exception(e)
-        start_scheduler()
-        app.run(host="0.0.0.0", port=PORT)
+    run_scan()
+
+    sched = BackgroundScheduler(timezone="UTC")
+    sched.add_job(run_scan, "interval", seconds=SCAN_EVERY_S)
+    sched.start()
+
+    port = int(os.getenv("PORT", "8080"))
+    app.run(host="0.0.0.0", port=port, debug=False)
+
+if __name__ == "__main__":
+    main()
