@@ -11,7 +11,7 @@ TD_API_KEY = os.getenv("TWELVEDATA_API_KEY", "").strip()
 BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
 CHAT_ID = os.getenv("CHAT_ID", "").strip()
 
-# Add all pairs here — bot will only send signals when conditions are *really good*
+# Pairs monitored
 PAIRS = ["EURUSD", "GBPUSD", "USDJPY", "EURCAD", "GBPAUD"]
 
 INTERVAL = "30min"
@@ -23,13 +23,13 @@ EMA_SLOW = 21
 RSI_LEN = 14
 ATR_LEN = 14
 
-# Signal conditions
-RSI_BUY_MIN = 55.0
-RSI_SELL_MAX = 45.0
+# Slightly looser thresholds to increase valid signals
+RSI_BUY_MIN = 52.0
+RSI_SELL_MAX = 48.0
 
-# Risk management (wider for volatile pairs)
-ATR_MULT_SL = 2.0   # was 1.5
-TP_R_MULT = 2.0     # same, 2× reward per risk
+# Risk management
+ATR_MULT_SL = 2.0
+TP_R_MULT = 2.0
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)s | %(message)s")
 log = logging.getLogger(__name__)
@@ -38,7 +38,6 @@ last_signal_dir = {}
 
 # ============ HELPERS ============
 def td_symbol(pair):
-    pair = pair.upper()
     if len(pair) == 6:
         return f"{pair[:3]}/{pair[3:]}"
     return pair
@@ -113,16 +112,23 @@ def check_signal(pair):
     rsi_n = rsi_val.iloc[-1]
     atr_n = atr_val.iloc[-1]
 
-    buy = cross_above(ema_f_n, ema_s_n, ema_f_p, ema_s_p) and rsi_n > RSI_BUY_MIN
-    sell = cross_below(ema_f_n, ema_s_n, ema_f_p, ema_s_p) and rsi_n < RSI_SELL_MAX
+    # --- Crossover or strong trend continuation ---
+    buy_signal = (
+        (cross_above(ema_f_n, ema_s_n, ema_f_p, ema_s_p) or ema_f_n > ema_s_n)
+        and rsi_n > RSI_BUY_MIN
+    )
+    sell_signal = (
+        (cross_below(ema_f_n, ema_s_n, ema_f_p, ema_s_p) or ema_f_n < ema_s_n)
+        and rsi_n < RSI_SELL_MAX
+    )
 
     prev = last_signal_dir.get(pair)
-    direction = "BUY" if buy else "SELL" if sell else None
+    direction = "BUY" if buy_signal else "SELL" if sell_signal else None
 
     if not direction or direction == prev:
-        return None  # No new valid signal
+        return None  # no new direction or duplicate
 
-    # Calculate SL/TP (wider range)
+    # Calculate SL/TP
     risk = atr_n * ATR_MULT_SL
     if pair.endswith("JPY"):
         pip = 0.01
@@ -160,7 +166,7 @@ def run_scan():
         except Exception as e:
             log.error(f"Error {p}: {e}")
 
-# ============ FLASK (keep alive) ============
+# ============ FLASK ============
 app = Flask(__name__)
 
 @app.get("/")
@@ -169,8 +175,9 @@ def health():
 
 def main():
     log.info("🚀 Starting Forex Signal Bot")
-    run_scan()
+    send_telegram("✅ <b>Bot is online!</b>\nMonitoring: EURUSD, GBPUSD, USDJPY, EURCAD, GBPAUD\nTimeframe: 30m")
 
+    run_scan()
     sched = BackgroundScheduler(timezone="UTC")
     sched.add_job(run_scan, "interval", seconds=SCAN_EVERY_S)
     sched.start()
