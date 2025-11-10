@@ -10,19 +10,26 @@ from flask import Flask
 TD_API_KEY = os.getenv("TWELVEDATA_API_KEY", "").strip()
 BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
 CHAT_ID = os.getenv("CHAT_ID", "").strip()
-PAIRS = os.getenv("PAIRS", "EURUSD,GBPUSD,USDJPY")
+
+# Add all pairs here — bot will only send signals when conditions are *really good*
+PAIRS = ["EURUSD", "GBPUSD", "USDJPY", "EURCAD", "GBPAUD"]
 
 INTERVAL = "30min"
 SCAN_EVERY_S = 30 * 60  # every 30 minutes
 
+# Indicator parameters
 EMA_FAST = 9
 EMA_SLOW = 21
 RSI_LEN = 14
 ATR_LEN = 14
+
+# Signal conditions
 RSI_BUY_MIN = 55.0
 RSI_SELL_MAX = 45.0
-ATR_MULT_SL = 1.5
-TP_R_MULT = 2.0
+
+# Risk management (wider for volatile pairs)
+ATR_MULT_SL = 2.0   # was 1.5
+TP_R_MULT = 2.0     # same, 2× reward per risk
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)s | %(message)s")
 log = logging.getLogger(__name__)
@@ -62,9 +69,11 @@ def ema(series, length):
 
 def rsi(series, length=14):
     delta = series.diff()
-    gain = (delta.clip(lower=0)).rolling(length).mean()
-    loss = (-delta.clip(upper=0)).rolling(length).mean()
-    rs = gain / loss
+    gain = delta.clip(lower=0)
+    loss = -delta.clip(upper=0)
+    avg_gain = gain.rolling(length).mean()
+    avg_loss = loss.rolling(length).mean()
+    rs = avg_gain / avg_loss
     return 100 - (100 / (1 + rs))
 
 def atr(df, length=14):
@@ -111,9 +120,9 @@ def check_signal(pair):
     direction = "BUY" if buy else "SELL" if sell else None
 
     if not direction or direction == prev:
-        return None
+        return None  # No new valid signal
 
-    # Calculate SL/TP
+    # Calculate SL/TP (wider range)
     risk = atr_n * ATR_MULT_SL
     if pair.endswith("JPY"):
         pip = 0.01
@@ -140,8 +149,7 @@ def check_signal(pair):
     )
 
 def run_scan():
-    pairs = [p.strip().upper() for p in PAIRS.split(",")]
-    for p in pairs:
+    for p in PAIRS:
         try:
             signal = check_signal(p)
             if signal:
