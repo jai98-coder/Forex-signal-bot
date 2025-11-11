@@ -6,16 +6,17 @@ import pandas as pd
 from apscheduler.schedulers.background import BackgroundScheduler
 from flask import Flask
 
-# ============ ENV ============
+# ============ CONFIG ============
 TD_API_KEY = os.getenv("TWELVEDATA_API_KEY", "").strip()
 BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
 CHAT_ID = os.getenv("CHAT_ID", "").strip()
 
-# Pairs monitored
+# Currency pairs to monitor
 PAIRS = ["EURUSD", "GBPUSD", "USDJPY", "EURCAD", "GBPAUD"]
 
-INTERVAL = "30min"
-SCAN_EVERY_S = 30 * 60  # every 30 minutes
+# Scalping mode
+INTERVAL = "15min"      # You can change to "30min" for swing
+SCAN_EVERY_S = 15 * 60  # every 15 minutes
 
 # Indicator parameters
 EMA_FAST = 9
@@ -23,13 +24,13 @@ EMA_SLOW = 21
 RSI_LEN = 14
 ATR_LEN = 14
 
-# Slightly looser thresholds to increase valid signals
-RSI_BUY_MIN = 52.0
-RSI_SELL_MAX = 48.0
+# Scalping thresholds
+RSI_BUY_MIN = 57.0
+RSI_SELL_MAX = 43.0
 
-# Risk management
-ATR_MULT_SL = 2.0
-TP_R_MULT = 2.0
+# Risk settings
+ATR_MULT_SL = 1.5
+ATR_MULT_TP = 1.2   # smaller TP for quicker profits
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)s | %(message)s")
 log = logging.getLogger(__name__)
@@ -81,12 +82,6 @@ def atr(df, length=14):
     tr = pd.concat([(high - low), (high - prev_close).abs(), (low - prev_close).abs()], axis=1).max(axis=1)
     return tr.rolling(length).mean()
 
-def cross_above(f_now, s_now, f_prev, s_prev):
-    return f_prev <= s_prev and f_now > s_now
-
-def cross_below(f_now, s_now, f_prev, s_prev):
-    return f_prev >= s_prev and f_now < s_now
-
 def send_telegram(text):
     if not BOT_TOKEN or not CHAT_ID:
         log.error("Missing Telegram vars")
@@ -106,42 +101,32 @@ def check_signal(pair):
     rsi_val = rsi(close, RSI_LEN)
     atr_val = atr(df, ATR_LEN)
 
-    ema_f_n, ema_f_p = ema_fast.iloc[-1], ema_fast.iloc[-2]
-    ema_s_n, ema_s_p = ema_slow.iloc[-1], ema_slow.iloc[-2]
+    ema_f_now = ema_fast.iloc[-1]
+    ema_s_now = ema_slow.iloc[-1]
     price = close.iloc[-1]
-    rsi_n = rsi_val.iloc[-1]
-    atr_n = atr_val.iloc[-1]
+    rsi_now = rsi_val.iloc[-1]
+    atr_now = atr_val.iloc[-1]
 
-    # --- Crossover or strong trend continuation ---
-    buy_signal = (
-        (cross_above(ema_f_n, ema_s_n, ema_f_p, ema_s_p) or ema_f_n > ema_s_n)
-        and rsi_n > RSI_BUY_MIN
-    )
-    sell_signal = (
-        (cross_below(ema_f_n, ema_s_n, ema_f_p, ema_s_p) or ema_f_n < ema_s_n)
-        and rsi_n < RSI_SELL_MAX
-    )
+    # Confirm direction
+    buy = ema_f_now > ema_s_now and rsi_now > RSI_BUY_MIN
+    sell = ema_f_now < ema_s_now and rsi_now < RSI_SELL_MAX
 
     prev = last_signal_dir.get(pair)
-    direction = "BUY" if buy_signal else "SELL" if sell_signal else None
+    direction = "BUY" if buy else "SELL" if sell else None
 
     if not direction or direction == prev:
-        return None  # no new direction or duplicate
+        return None  # no change or duplicate
 
-    # Calculate SL/TP
-    risk = atr_n * ATR_MULT_SL
-    if pair.endswith("JPY"):
-        pip = 0.01
-    else:
-        pip = 0.0001
-
+    # SL and TP
+    risk = atr_now * ATR_MULT_SL
+    tp_dist = atr_now * ATR_MULT_TP
     if direction == "BUY":
         sl = price - risk
-        tp = price + risk * TP_R_MULT
+        tp = price + tp_dist
         emoji = "🟢"
     else:
         sl = price + risk
-        tp = price - risk * TP_R_MULT
+        tp = price - tp_dist
         emoji = "🔴"
 
     last_signal_dir[pair] = direction
@@ -174,8 +159,8 @@ def health():
     return "OK", 200
 
 def main():
-    log.info("🚀 Starting Forex Signal Bot")
-    send_telegram("✅ <b>Bot is online!</b>\nMonitoring: EURUSD, GBPUSD, USDJPY, EURCAD, GBPAUD\nTimeframe: 30m")
+    log.info("🚀 Starting Forex Signal Bot (Scalp Mode)")
+    send_telegram("⚡️ <b>Scalp Bot Active</b>\nMonitoring: EURUSD, GBPUSD, USDJPY, EURCAD, GBPAUD\nTimeframe: 15m")
 
     run_scan()
     sched = BackgroundScheduler(timezone="UTC")
