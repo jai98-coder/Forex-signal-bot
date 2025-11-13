@@ -6,40 +6,40 @@ import pandas as pd
 from apscheduler.schedulers.background import BackgroundScheduler
 from flask import Flask
 
-# ============ ENVIRONMENT VARIABLES ============
+# ============ ENV ============
 TD_API_KEY = os.getenv("TWELVEDATA_API_KEY", "").strip()
 BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
 CHAT_ID = os.getenv("CHAT_ID", "").strip()
 
-PAIRS = "EURUSD,GBPUSD,USDJPY,EURCAD,GBPAUD,GBPCAD,USDCAD,EURNZD,NZDUSD,EURGBP,AUDUSD,GBPJPY"
+# MAX 8 PAIRS FOR FREE TIER
+PAIRS = os.getenv("PAIRS", "EURUSD,GBPUSD,USDJPY,EURCAD,GBPAUD,GBPCAD,USDCAD,GBPJPY")
 
 INTERVAL = "30min"
-SCAN_EVERY_S = 15 * 60   # scan every 15 minutes
+SCAN_EVERY_S = 15 * 60  # every 15 minutes
 
-# STRATEGY SETTINGS (Option C – strongest filtering)
-EMA_FAST = 9
-EMA_SLOW = 21
+# Strategy Settings (Improved Scalping)
+EMA_FAST = 5
+EMA_SLOW = 20
 RSI_LEN = 14
+RSI_BUY_MIN = 60
+RSI_SELL_MAX = 40
 ATR_LEN = 14
 
-RSI_BUY_MIN = 58       # higher = fewer but cleaner buys
-RSI_SELL_MAX = 42      # lower  = fewer but cleaner sells
-
-SL_ATR_MULT = 1.2      # SL distance
-TP1_MULT = 1.0         # TP1 = 1× ATR
-TP2_MULT = 1.7         # TP2 = 1.7× ATR
-TP3_MULT = 2.3         # TP3 = 2.3× ATR
+# Tighter scalping targets
+SL_ATR = 0.8
+TP1_ATR = 1.2
+TP2_ATR = 2.0
+TP3_ATR = 3.0
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)s | %(message)s")
 log = logging.getLogger(__name__)
 
-last_signal = {}
+last_signal_dir = {}
 
-# ============ DATA HELPERS ============
-
+# ============ HELPERS ============
 def td_symbol(pair):
-    return f"{pair[:3]}/{pair[3:]}"
-
+    pair = pair.upper()
+    return f"{pair[:3]}/{pair[3:]}" if len(pair) == 6 else pair
 
 def fetch_data(pair):
     url = "https://api.twelvedata.com/time_series"
@@ -48,7 +48,7 @@ def fetch_data(pair):
         "interval": INTERVAL,
         "apikey": TD_API_KEY,
         "outputsize": 200,
-        "order": "asc"
+        "order": "asc",
     }
     r = requests.get(url, params=params, timeout=20)
     r.raise_for_status()
@@ -65,143 +65,120 @@ def fetch_data(pair):
     df = df.sort_values("datetime").reset_index(drop=True)
     return df
 
-
 def ema(series, length):
     return series.ewm(span=length, adjust=False).mean()
 
-
 def rsi(series, length=14):
     delta = series.diff()
-    gain = delta.clip(lower=0).rolling(length).mean()
+    gain = (delta.clip(lower=0)).rolling(length).mean()
     loss = (-delta.clip(upper=0)).rolling(length).mean()
     rs = gain / loss
     return 100 - (100 / (1 + rs))
 
-
 def atr(df, length=14):
-    high = df["high"]
-    low = df["low"]
-    close = df["close"]
+    high, low, close = df["high"], df["low"], df["close"]
     prev_close = close.shift(1)
-
     tr = pd.concat([
-        high - low,
+        (high - low),
         (high - prev_close).abs(),
         (low - prev_close).abs()
     ], axis=1).max(axis=1)
 
     return tr.rolling(length).mean()
 
+def cross_above(nf, ns, pf, ps):
+    return pf <= ps and nf > ns
 
-def cross_above(f_now, s_now, f_prev, s_prev):
-    return f_prev <= s_prev and f_now > s_now
+def cross_below(nf, ns, pf, ps):
+    return pf >= ps and nf < ns
 
-
-def cross_below(f_now, s_now, f_prev, s_prev):
-    return f_prev >= s_prev and f_now < s_now
-
-
-# ============ TELEGRAM SEND ============
 def send_telegram(text):
     if not BOT_TOKEN or not CHAT_ID:
         log.error("Missing Telegram vars")
         return
-
     url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
-    payload = {"chat_id": CHAT_ID, "text": text, "parse_mode": "HTML"}
-
     try:
-        requests.post(url, json=payload, timeout=10)
+        requests.post(url, json={"chat_id": CHAT_ID, "text": text, "parse_mode": "HTML"}, timeout=10)
     except Exception as e:
-        log.error(f"Telegram send failed: {e}")
+        log.error("Telegram error: %s", e)
 
-
-# ============ SIGNAL CHECKER ============
 def check_signal(pair):
     df = fetch_data(pair)
-
     close = df["close"]
+
     ema_fast = ema(close, EMA_FAST)
     ema_slow = ema(close, EMA_SLOW)
     rsi_val = rsi(close, RSI_LEN)
     atr_val = atr(df, ATR_LEN)
 
+    f_now, f_prev = ema_fast.iloc[-1], ema_fast.iloc[-2]
+    s_now, s_prev = ema_slow.iloc[-1], ema_slow.iloc[-2]
+    rsi_now = rsi_val.iloc[-1]
+    atr_now = atr_val.iloc[-1]
     price = close.iloc[-1]
-    ema_f_n, ema_f_p = ema_fast.iloc[-1], ema_fast.iloc[-2]
-    ema_s_n, ema_s_p = ema_slow.iloc[-1], ema_slow.iloc[-2]
-    rsi_n = rsi_val.iloc[-1]
-    atr_n = atr_val.iloc[-1]
 
-    # ENTRY CONDITIONS
-    buy = cross_above(ema_f_n, ema_s_n, ema_f_p, ema_s_p) and rsi_n > RSI_BUY_MIN
-    sell = cross_below(ema_f_n, ema_s_n, ema_f_p, ema_s_p) and rsi_n < RSI_SELL_MAX
+    # Direction
+    buy = cross_above(f_now, s_now, f_prev, s_prev) and rsi_now > RSI_BUY_MIN
+    sell = cross_below(f_now, s_now, f_prev, s_prev) and rsi_now < RSI_SELL_MAX
 
     direction = "BUY" if buy else "SELL" if sell else None
-    if direction is None:
+
+    if not direction:
         return None
 
-    # Avoid duplicates
-    if last_signal.get(pair) == direction:
+    # Prevent duplicate signals
+    if last_signal_dir.get(pair) == direction:
         return None
 
-    # ATR distances
-    sl_dist = atr_n * SL_ATR_MULT
-    tp1_dist = atr_n * TP1_MULT
-    tp2_dist = atr_n * TP2_MULT
-    tp3_dist = atr_n * TP3_MULT
+    # PIP handling
+    pip = 0.01 if pair.endswith("JPY") else 0.0001
 
+    # SL & TP based on ATR scalping
     if direction == "BUY":
-        sl = price - sl_dist
-        tp1 = price + tp1_dist
-        tp2 = price + tp2_dist
-        tp3 = price + tp3_dist
+        sl = price - atr_now * SL_ATR
+        tp1 = price + atr_now * TP1_ATR
+        tp2 = price + atr_now * TP2_ATR
+        tp3 = price + atr_now * TP3_ATR
         emoji = "🟢"
     else:
-        sl = price + sl_dist
-        tp1 = price - tp1_dist
-        tp2 = price - tp2_dist
-        tp3 = price - tp3_dist
+        sl = price + atr_now * SL_ATR
+        tp1 = price - atr_now * TP1_ATR
+        tp2 = price - atr_now * TP2_ATR
+        tp3 = price - atr_now * TP3_ATR
         emoji = "🔴"
 
-    last_signal[pair] = direction
+    last_signal_dir[pair] = direction
 
-    # MESSAGE
     return (
-        f"📊 <b>{pair}</b>\n"
+        f"📉📈 <b>{pair}</b>\n"
         f"{emoji} <b>{direction}</b>\n"
-        f"💰 Entry: {price:.5f}\n"
+        f"💰 Price: {price:.5f}\n"
+        f"🛑 SL: {sl:.5f}\n"
         f"🎯 TP1: {tp1:.5f}\n"
         f"🎯 TP2: {tp2:.5f}\n"
-        f"🎯 TP3: {tp3:.5f}\n"
-        f"⛔ SL: {sl:.5f}"
+        f"🎯 TP3: {tp3:.5f}"
     )
 
-
-# ============ SCAN LOOP ============
 def run_scan():
     pairs = [p.strip().upper() for p in PAIRS.split(",")]
-
     for p in pairs:
         try:
-            sig = check_signal(p)
-            if sig:
-                log.info(f"Signal for {p}")
-                send_telegram(sig)
+            s = check_signal(p)
+            if s:
+                log.info(f"Signal for {p}: {s}")
+                send_telegram(s)
             else:
                 log.info(f"No valid signal for {p}")
         except Exception as e:
             log.error(f"Error {p}: {e}")
 
-
-# ============ FLASK KEEP-ALIVE ============
+# ============ FLASK ============
 app = Flask(__name__)
 
 @app.get("/")
 def health():
     return "OK", 200
 
-
-# ============ MAIN ============
 def main():
     log.info("🚀 Starting Forex Signal Bot")
     run_scan()
@@ -212,7 +189,6 @@ def main():
 
     port = int(os.getenv("PORT", "8080"))
     app.run(host="0.0.0.0", port=port, debug=False)
-
 
 if __name__ == "__main__":
     main()
