@@ -1,6 +1,6 @@
 import os
 import logging
-from datetime import datetime, time, timezone
+from datetime import datetime, time
 from zoneinfo import ZoneInfo
 
 import requests
@@ -8,53 +8,44 @@ import pandas as pd
 from apscheduler.schedulers.background import BackgroundScheduler
 from flask import Flask
 
-# ============ ENV & CONFIG ============
-
+# ================== ENV VARS ==================
 TD_API_KEY = os.getenv("TWELVEDATA_API_KEY", "").strip()
 BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
 CHAT_ID = os.getenv("CHAT_ID", "").strip()
 
-# Default pairs – you can override with PAIRS env if you want
-DEFAULT_PAIRS = [
-    "GBPCAD", "USDCAD", "EURCAD", "USDJPY", "EURGBP", "GBPUSD",
-    "GBPAUD", "AUDUSD", "GBPJPY", "EURNZD", "NZDUSD", "EURUSD",
-]
+# Default pairs – you can override with PAIRS env
+PAIRS = os.getenv(
+    "PAIRS",
+    "EURUSD,GBPUSD,USDJPY,EURCAD,GBPAUD,GBPCAD,USDCAD,GBPJPY,EURNZD,EURGBP,AUDUSD,NZDUSD",
+)
 
-pairs_env = os.getenv("PAIRS", "").strip()
-if pairs_env:
-    ALL_PAIRS = [p.strip().upper() for p in pairs_env.split(",") if p.strip()]
-else:
-    ALL_PAIRS = DEFAULT_PAIRS
+INTERVAL = "30min"
+SCAN_EVERY_S = 15 * 60  # every 15 minutes
 
-INTERVAL = "1h"          # 1-hour candles
-SCAN_EVERY_S = 60 * 60   # scan once per hour
-
-# Indicator settings (conservative)
+# Strategy parameters (Option A: High Accuracy)
 EMA_FAST = 20
 EMA_SLOW = 50
-RSI_LEN = 14
-ADX_LEN = 14
 MACD_FAST = 12
 MACD_SLOW = 26
 MACD_SIGNAL = 9
 
-RSI_BUY_MIN = 55.0
-RSI_BUY_MAX = 70.0
-RSI_SELL_MIN = 30.0
-RSI_SELL_MAX = 45.0
+RSI_LEN = 14
+RSI_BUY_MIN = 40.0
+RSI_BUY_MAX = 65.0
+RSI_SELL_MIN = 35.0
+RSI_SELL_MAX = 60.0
 
-ADX_MIN = 22.0           # need clear trend
+ADX_LEN = 14
+ADX_MIN = 20.0  # minimum trend strength
 
 ATR_LEN = 14
-ATR_MULT_SL = 1.0        # tighter SL for scalps
-TP1_R_MULT = 1.0
-TP2_R_MULT = 1.6
-TP3_R_MULT = 2.2
+ATR_SL_MULT = 1.0
+TP1_MULT = 1.0   # 1R
+TP2_MULT = 1.8   # ~1.8R
+TP3_MULT = 2.5   # ~2.5R
 
-# Trading session – Europe/Madrid
-TRADING_TZ = ZoneInfo("Europe/Madrid")
-TRADING_START = time(7, 15)   # 07:15 local
-TRADING_END = time(22, 0)     # 22:00 local
+# How many pairs per run (to stay under 8 requests / minute)
+PAIRS_PER_RUN = 6
 
 logging.basicConfig(
     level=logging.INFO,
@@ -62,25 +53,13 @@ logging.basicConfig(
 )
 log = logging.getLogger(__name__)
 
-# Track last signal dir & time to avoid spam
-last_signal_state = {}  # pair -> {"dir": "BUY"/"SELL", "time": datetime}
-
-# ========= PAIR GROUPING (respect 8 credits/min) =========
-
-def build_groups(pairs, max_per_group=8):
-    groups = []
-    for i in range(0, len(pairs), max_per_group):
-        groups.append(pairs[i:i + max_per_group])
-    return groups or [[]]
-
-PAIR_GROUPS = build_groups(ALL_PAIRS, max_per_group=8)
-group_index = 0  # will rotate each hour
+# Track last direction per pair to avoid spam
+last_signal_dir = {}
+pair_index = 0  # for rotating through pairs
 
 
-# ============ HELPERS ============
-
+# ================== HELPERS ==================
 def td_symbol(pair: str) -> str:
-    """Convert 'EURUSD' -> 'EUR/USD' for TwelveData."""
     pair = pair.upper()
     if len(pair) == 6:
         return f"{pair[:3]}/{pair[3:]}"
@@ -88,42 +67,50 @@ def td_symbol(pair: str) -> str:
 
 
 def fetch_data(pair: str) -> pd.DataFrame:
+    if not TD_API_KEY:
+        raise RuntimeError("TWELVEDATA_API_KEY env var is missing")
+
     url = "https://api.twelvedata.com/time_series"
     params = {
         "symbol": td_symbol(pair),
         "interval": INTERVAL,
         "apikey": TD_API_KEY,
-        "outputsize": 300,
+        "outputsize": 200,
         "order": "asc",
     }
     r = requests.get(url, params=params, timeout=20)
     r.raise_for_status()
     data = r.json()
+
     if "values" not in data:
         raise ValueError(f"TwelveData error: {data}")
+
     df = pd.DataFrame(data["values"])
     for col in ["open", "high", "low", "close"]:
         df[col] = pd.to_numeric(df[col], errors="coerce")
     df["datetime"] = pd.to_datetime(df["datetime"])
     df = df.sort_values("datetime").reset_index(drop=True)
-    return df.dropna()
+    return df
 
 
 def ema(series: pd.Series, length: int) -> pd.Series:
     return series.ewm(span=length, adjust=False).mean()
 
 
-def rsi(series: pd.Series, length: int = 14) -> pd.Series:
+def rsi(series: pd.Series, length: int) -> pd.Series:
     delta = series.diff()
     gain = delta.clip(lower=0)
     loss = -delta.clip(upper=0)
+
     avg_gain = gain.rolling(length).mean()
     avg_loss = loss.rolling(length).mean()
-    rs = avg_gain / avg_loss.replace(0, pd.NA)
-    return 100 - (100 / (1 + rs))
+
+    rs = avg_gain / avg_loss
+    rsi_val = 100 - (100 / (1 + rs))
+    return rsi_val
 
 
-def atr(df: pd.DataFrame, length: int = 14) -> pd.Series:
+def atr(df: pd.DataFrame, length: int) -> pd.Series:
     high, low, close = df["high"], df["low"], df["close"]
     prev_close = close.shift(1)
     tr = pd.concat(
@@ -137,16 +124,17 @@ def atr(df: pd.DataFrame, length: int = 14) -> pd.Series:
     return tr.rolling(length).mean()
 
 
-def adx(df: pd.DataFrame, length: int = 14) -> pd.Series:
+def adx(df: pd.DataFrame, length: int) -> pd.Series:
     high, low, close = df["high"], df["low"], df["close"]
     prev_high = high.shift(1)
     prev_low = low.shift(1)
     prev_close = close.shift(1)
 
-    plus_dm = (high - prev_high)
-    minus_dm = (prev_low - low)
-    plus_dm = plus_dm.where((plus_dm > minus_dm) & (plus_dm > 0), 0.0)
-    minus_dm = minus_dm.where((minus_dm > plus_dm) & (minus_dm > 0), 0.0)
+    plus_dm = (high - prev_high).clip(lower=0)
+    minus_dm = (prev_low - low).clip(lower=0)
+
+    plus_dm = plus_dm.where(plus_dm > minus_dm, 0.0)
+    minus_dm = minus_dm.where(minus_dm > plus_dm, 0.0)
 
     tr = pd.concat(
         [
@@ -157,31 +145,62 @@ def adx(df: pd.DataFrame, length: int = 14) -> pd.Series:
         axis=1,
     ).max(axis=1)
 
-    atr_series = tr.rolling(length).mean()
+    atr_val = tr.rolling(length).mean()
+    plus_di = 100 * (plus_dm.rolling(length).mean() / atr_val)
+    minus_di = 100 * (minus_dm.rolling(length).mean() / atr_val)
 
-    plus_di = 100 * (plus_dm.rolling(length).mean() / atr_series)
-    minus_di = 100 * (minus_dm.rolling(length).mean() / atr_series)
-
-    dx = 100 * (plus_di - minus_di).abs() / (plus_di + minus_di).abs()
-    return dx.rolling(length).mean()
+    dx = (abs(plus_di - minus_di) / (plus_di + minus_di)).replace([pd.NA, pd.NaT], 0) * 100
+    adx_val = dx.rolling(length).mean()
+    return adx_val
 
 
 def macd(series: pd.Series):
-    fast = ema(series, MACD_FAST)
-    slow = ema(series, MACD_SLOW)
-    line = fast - slow
-    signal = ema(line, MACD_SIGNAL)
-    hist = line - signal
-    return line, signal, hist
+    ema_fast = ema(series, MACD_FAST)
+    ema_slow = ema(series, MACD_SLOW)
+    macd_line = ema_fast - ema_slow
+    signal = ema(macd_line, MACD_SIGNAL)
+    hist = macd_line - signal
+    return macd_line, signal, hist
 
 
-def in_trading_session(now_utc: datetime) -> bool:
-    local = now_utc.astimezone(TRADING_TZ)
-    t = local.time()
-    if TRADING_START <= t <= TRADING_END:
-        return True
-    log.info("Outside trading hours (Europe/Madrid): %s", local)
-    return False
+def within_trading_session() -> bool:
+    """Trading window: 07:15–22:00 Europe/Madrid, Monday–Friday."""
+    now_local = datetime.now(ZoneInfo("Europe/Madrid"))
+    # Monday=0 ... Sunday=6
+    if now_local.weekday() >= 5:
+        return False
+
+    t = now_local.time()
+    start = time(7, 15)
+    end = time(22, 0)
+    return start <= t <= end
+
+
+def cross_above(curr_fast, curr_slow, prev_fast, prev_slow) -> bool:
+    return prev_fast <= prev_slow and curr_fast > curr_slow
+
+
+def cross_below(curr_fast, curr_slow, prev_fast, prev_slow) -> bool:
+    return prev_fast >= prev_slow and curr_fast < curr_slow
+
+
+def send_telegram(text: str):
+    if not BOT_TOKEN or not CHAT_ID:
+        log.error("Missing BOT_TOKEN or CHAT_ID env vars")
+        return
+
+    url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
+    data = {
+        "chat_id": CHAT_ID,
+        "text": text,
+        "parse_mode": "HTML",
+    }
+    try:
+        r = requests.post(url, json=data, timeout=10)
+        if r.status_code != 200:
+            log.error("Telegram error: %s", r.text)
+    except Exception as e:
+        log.error("Telegram send failed: %s", e)
 
 
 def format_price(pair: str, value: float) -> str:
@@ -191,94 +210,98 @@ def format_price(pair: str, value: float) -> str:
         return f"{value:.5f}"
 
 
-def send_telegram(text: str):
-    if not BOT_TOKEN or not CHAT_ID:
-        log.error("Missing Telegram BOT_TOKEN or CHAT_ID")
-        return
-    url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
-    payload = {"chat_id": CHAT_ID, "text": text, "parse_mode": "HTML"}
-    try:
-        requests.post(url, json=payload, timeout=10)
-    except Exception as e:
-        log.error("Telegram send failed: %s", e)
-
-
-# ============ STRATEGY (Option B conservative) ============
-
-def check_signal(pair: str):
+# ================== SIGNAL LOGIC ==================
+def build_signal(pair: str):
     df = fetch_data(pair)
-    if len(df) < max(EMA_SLOW, RSI_LEN, ATR_LEN) + 5:
+
+    if len(df) < max(EMA_SLOW, MACD_SLOW, RSI_LEN, ATR_LEN, ADX_LEN) + 5:
         return None
 
     close = df["close"]
-    high = df["high"]
-    low = df["low"]
 
     ema_fast = ema(close, EMA_FAST)
     ema_slow = ema(close, EMA_SLOW)
+
+    macd_line, macd_signal, macd_hist = macd(close)
     rsi_val = rsi(close, RSI_LEN)
     atr_val = atr(df, ATR_LEN)
     adx_val = adx(df, ADX_LEN)
-    _, _, macd_hist = macd(close)
 
     ema_f_now, ema_f_prev = ema_fast.iloc[-1], ema_fast.iloc[-2]
     ema_s_now, ema_s_prev = ema_slow.iloc[-1], ema_slow.iloc[-2]
+
+    macd_hist_now, macd_hist_prev = macd_hist.iloc[-1], macd_hist.iloc[-2]
     rsi_now = rsi_val.iloc[-1]
-    adx_now = adx_val.iloc[-1]
-    macd_h_now = macd_hist.iloc[-1]
-    macd_h_prev = macd_hist.iloc[-2]
-    price = close.iloc[-1]
     atr_now = atr_val.iloc[-1]
+    adx_now = adx_val.iloc[-1]
+    price = close.iloc[-1]
 
-    # Require healthy trend
-    up_trend = ema_f_now > ema_s_now and ema_f_now > ema_f_prev and ema_s_now >= ema_s_prev
-    down_trend = ema_f_now < ema_s_now and ema_f_now < ema_f_prev and ema_s_now <= ema_s_prev
-
-    # RSI filter (avoid overextended)
-    buy_rsi_ok = RSI_BUY_MIN <= rsi_now <= RSI_BUY_MAX
-    sell_rsi_ok = RSI_SELL_MIN <= rsi_now <= RSI_SELL_MAX
-
-    # Momentum: MACD histogram direction
-    buy_momentum = macd_h_now > 0 and macd_h_now > macd_h_prev
-    sell_momentum = macd_h_now < 0 and macd_h_now < macd_h_prev
-
-    # Trend strength
-    trend_ok = adx_now >= ADX_MIN
-
-    buy = up_trend and buy_rsi_ok and buy_momentum and trend_ok
-    sell = down_trend and sell_rsi_ok and sell_momentum and trend_ok
-
-    direction = "BUY" if buy else "SELL" if sell else None
-    if direction is None:
-        return None
-
-    # Avoid duplicate signals in same direction within last 2 candles
-    now_utc = datetime.now(timezone.utc)
-    st = last_signal_state.get(pair)
-    if st and st["dir"] == direction:
-        # only allow new signal if more than 2 candles ago
-        if (now_utc - st["time"]).total_seconds() < 2 * SCAN_EVERY_S:
+    # ATR percentile filter (volatility not too low)
+    recent_atr = atr_val.dropna().tail(100)
+    if len(recent_atr) >= 20:
+        atr_threshold = recent_atr.quantile(0.2)
+        if atr_now < atr_threshold:
             return None
 
-    # ATR-based SL/TP
-    risk = float(atr_now) * ATR_MULT_SL
-    if risk <= 0:
+    # Trend filters
+    trend_up = ema_f_now > ema_s_now
+    trend_down = ema_f_now < ema_s_now
+
+    # MACD confirmation (direction + hist increasing in trend direction)
+    macd_bull = macd_hist_now > 0 and macd_hist_now > macd_hist_prev
+    macd_bear = macd_hist_now < 0 and macd_hist_now < macd_hist_prev
+
+    # ADX strength
+    if pd.isna(adx_now) or adx_now < ADX_MIN:
         return None
+
+    # Price not too extended from ema_fast (avoid chasing)
+    # Allow max 0.3% away from EMA_FAST
+    max_ext = 0.003 * price
+    if abs(price - ema_f_now) > max_ext:
+        return None
+
+    # Entry conditions (Option A high accuracy, but you picked intra-candle mode)
+    buy = (
+        trend_up
+        and macd_bull
+        and RSI_BUY_MIN <= rsi_now <= RSI_BUY_MAX
+        and cross_above(ema_f_now, ema_s_now, ema_f_prev, ema_s_prev)
+    )
+
+    sell = (
+        trend_down
+        and macd_bear
+        and RSI_SELL_MIN <= rsi_now <= RSI_SELL_MAX
+        and cross_below(ema_f_now, ema_s_now, ema_f_prev, ema_s_prev)
+    )
+
+    direction = "BUY" if buy else "SELL" if sell else None
+    if not direction:
+        return None
+
+    prev_dir = last_signal_dir.get(pair)
+    if prev_dir == direction:
+        # avoid repeating same direction signal in same trend leg
+        return None
+
+    # --- Risk / Reward: SL + TP1/2/3 ---
+    risk = ATR_SL_MULT * atr_now
 
     if direction == "BUY":
         sl = price - risk
-        tp1 = price + risk * TP1_R_MULT
-        tp2 = price + risk * TP2_R_MULT
-        tp3 = price + risk * TP3_R_MULT
+        tp1 = price + risk * TP1_MULT
+        tp2 = price + risk * TP2_MULT
+        tp3 = price + risk * TP3_MULT
         emoji = "🟢"
     else:
         sl = price + risk
-        tp1 = price - risk * TP1_R_MULT
-        tp2 = price - risk * TP2_R_MULT
-        tp3 = price - risk * TP3_R_MULT
+        tp1 = price - risk * TP1_MULT
+        tp2 = price - risk * TP2_MULT
+        tp3 = price - risk * TP3_MULT
         emoji = "🔴"
 
-    last_signal_state[pair] = {"dir": direction, "time": now_utc}
+    last_signal_dir[pair] = direction
 
     price_str = format_price(pair, price)
     sl_str = format_price(pair, sl)
@@ -289,7 +312,7 @@ def check_signal(pair: str):
     text = (
         f"📉📈 <b>{pair}</b>\n"
         f"{emoji} <b>{direction}</b>\n"
-        f"💰 Entry: {price_str}\n"
+        f"💰 Price: {price_str}\n"
         f"🛑 SL: {sl_str}\n"
         f"🎯 TP1: {tp1_str}\n"
         f"🎯 TP2: {tp2_str}\n"
@@ -298,29 +321,35 @@ def check_signal(pair: str):
     return text
 
 
-# ============ SCAN LOOP ============
-
 def run_scan():
-    global group_index
+    global pair_index
 
-    now_utc = datetime.now(timezone.utc)
-    if not in_trading_session(now_utc):
+    if not within_trading_session():
+        log.info("Outside trading hours (Madrid 07:15–22:00). Skipping scan.")
         return
 
-    if not TD_API_KEY:
-        log.error("Missing TWELVEDATA_API_KEY")
+    pairs = [p.strip().upper() for p in PAIRS.split(",") if p.strip()]
+    if not pairs:
+        log.error("No pairs configured in PAIRS env.")
         return
 
-    pairs = PAIR_GROUPS[group_index]
-    log.info("Scanning group %d / %d: %s",
-             group_index + 1, len(PAIR_GROUPS), ", ".join(pairs))
-    group_index = (group_index + 1) % len(PAIR_GROUPS)
+    if PAIRS_PER_RUN >= len(pairs):
+        batch = pairs
+    else:
+        start = pair_index
+        end = start + PAIRS_PER_RUN
+        # wrap around
+        extended = pairs + pairs
+        batch = extended[start:end]
+        pair_index = (pair_index + PAIRS_PER_RUN) % len(pairs)
 
-    for p in pairs:
+    log.info("Scanning pairs this run: %s", ", ".join(batch))
+
+    for p in batch:
         try:
-            signal = check_signal(p)
+            signal = build_signal(p)
             if signal:
-                log.info("Signal for %s:\n%s", p, signal)
+                log.info("Signal for %s", p)
                 send_telegram(signal)
             else:
                 log.info("No valid signal for %s", p)
@@ -328,9 +357,9 @@ def run_scan():
             log.error("Error %s: %s", p, e)
 
 
-# ============ FLASK (keep alive) ============
-
+# ================== FLASK APP (keep-alive) ==================
 app = Flask(__name__)
+
 
 @app.get("/")
 def health():
@@ -339,8 +368,16 @@ def health():
 
 def main():
     log.info("🚀 Starting Forex Signal Bot")
-    run_scan()  # first scan on startup
 
+    if not TD_API_KEY:
+        log.error("Missing TWELVEDATA_API_KEY env var")
+    if not BOT_TOKEN or not CHAT_ID:
+        log.error("Missing BOT_TOKEN or CHAT_ID env vars")
+
+    # Run once at startup
+    run_scan()
+
+    # Schedule every 15 minutes (UTC)
     sched = BackgroundScheduler(timezone="UTC")
     sched.add_job(run_scan, "interval", seconds=SCAN_EVERY_S)
     sched.start()
