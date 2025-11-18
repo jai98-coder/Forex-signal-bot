@@ -1,4 +1,4 @@
-flask==3.1.2
-requests==2.32.3
-pandas==2.2.3
-APScheduler==3.10.4
+pandas
+requests
+APScheduler
+flask
